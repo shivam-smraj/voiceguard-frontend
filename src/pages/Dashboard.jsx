@@ -10,9 +10,33 @@ const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000';
 // Wake up sleeping HuggingFace Space before connecting
 async function warmBackend() {
   try {
-    await fetch(`${BACKEND_URL}/health`, { method: 'GET', signal: AbortSignal.timeout(20000) });
+    await fetch(`${BACKEND_URL}/health`, { method: 'GET', signal: AbortSignal.timeout(25000) });
     return true;
   } catch { return false; }
+}
+
+// Connect WebSocket with up to maxRetries attempts + exponential backoff
+// Needed because HF Space needs 1-2s after /health before WS upgrades work
+function connectWebSocket(url, maxRetries = 4) {
+  return new Promise((resolve, reject) => {
+    let attempt = 0;
+    const try_ = () => {
+      const ws = new WebSocket(url);
+      const timeout = setTimeout(() => {
+        ws.close();
+        retry(new Error('timeout'));
+      }, 8000);
+      ws.onopen = () => { clearTimeout(timeout); resolve(ws); };
+      ws.onerror = () => { clearTimeout(timeout); retry(new Error('error')); };
+    };
+    const retry = (err) => {
+      attempt++;
+      if (attempt >= maxRetries) { reject(err); return; }
+      const delay = Math.min(1000 * 2 ** attempt, 8000);
+      setTimeout(try_, delay);
+    };
+    try_();
+  });
 }
 
 // ─── Downsample helper (fixes live mic bug: browser is 44100/48000Hz, model needs 16000Hz)
@@ -274,29 +298,36 @@ export default function Dashboard() {
       const src = ac.createMediaStreamSource(stream);
       src.connect(analyser);
 
-      // WebSocket to backend
+      // WebSocket with retry (fixes HF cold-start: /health OK but WS not ready yet)
       const wsProto = BACKEND_URL.startsWith('https') ? 'wss' : 'ws';
       const wsBase  = BACKEND_URL.replace(/^https?/, wsProto);
-      const ws = new WebSocket(`${wsBase}/stream`);
+      const wsUrl   = `${wsBase}/stream`;
+
+      let ws;
+      try {
+        toast.loading('Connecting stream…', { id: 'ws-connect' });
+        ws = await connectWebSocket(wsUrl, 4);
+        toast.dismiss('ws-connect');
+      } catch {
+        toast.error('Live stream unavailable — use file upload instead', { id: 'ws-connect' });
+        stopAll(); setStatus('IDLE'); return;
+      }
       wsRef.current = ws;
 
       let counter = 0;
-      ws.onopen = () => {
-        setIsRecording(true);
-        timerRef.current = setInterval(() => setElapsedSec(s => s + 1), 1000);
-        toast.success('Live stream started ✓');
-      };
       ws.onmessage = (ev) => {
         const d = JSON.parse(ev.data);
-        if (d.ping) return; // keep-alive from server
+        if (d.ping) return;
         setRiskScore(d.score || 0);
         setRiskLevel(d.risk || 'ANALYZING');
         counter++;
         setChunks(prev => [...prev, { id: counter, score: d.score || 0, risk: d.risk || 'ANALYZING' }]);
         setChartData(prev => [...prev, { t: counter, score: +((d.score || 0) * 100).toFixed(1) }]);
       };
-      ws.onerror = () => toast.error('WebSocket error — backend may be sleeping, try again');
       ws.onclose = () => { setIsRecording(false); setStatus(s => s === 'ANALYZING' ? 'FINISHED' : s); };
+      setIsRecording(true);
+      timerRef.current = setInterval(() => setElapsedSec(s => s + 1), 1000);
+      toast.success('Live stream started ✓');
 
       // Use AudioWorkletNode if supported (Chrome 66+), fallback to ScriptProcessor
       try {
