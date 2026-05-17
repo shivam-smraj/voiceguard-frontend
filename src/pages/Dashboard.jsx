@@ -7,6 +7,14 @@ import { AreaChart, Area, ResponsiveContainer, Tooltip, XAxis } from 'recharts';
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000';
 const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000';
 
+// Wake up sleeping HuggingFace Space before connecting
+async function warmBackend() {
+  try {
+    await fetch(`${BACKEND_URL}/health`, { method: 'GET', signal: AbortSignal.timeout(20000) });
+    return true;
+  } catch { return false; }
+}
+
 // ─── Downsample helper (fixes live mic bug: browser is 44100/48000Hz, model needs 16000Hz)
 function downsample(buffer, fromRate, toRate) {
   if (fromRate === toRate) return buffer;
@@ -212,12 +220,15 @@ export default function Dashboard() {
     const f = e.target.files?.[0];
     if (!f) return;
     stopAll(); resetState(); setStatus('ANALYZING');
-    toast.loading('Uploading audio…', { id: 'upload' });
+    toast.loading('Waking backend…', { id: 'upload' });
+    await warmBackend(); // ping /health to wake HF Space
+    toast.loading('Analyzing audio…', { id: 'upload' });
     const form = new FormData();
     form.append('file', f);
     try {
       const res  = await fetch(`${BACKEND_URL}/analyze`, { method: 'POST', body: form });
       const data = await res.json();
+      if (data.inference_ms) toast.success(`Done in ${(data.inference_ms/1000).toFixed(1)}s`, { id: 'upload' });
       toast.success('Analysis complete!', { id: 'upload' });
       if (data.results?.length) {
         data.results.forEach((r, idx) => {
@@ -240,77 +251,90 @@ export default function Dashboard() {
     }
   };
 
-  // ── LIVE MIC (all 3 bugs fixed)
+  // ── LIVE MIC — uses AudioWorkletNode (replaces deprecated ScriptProcessorNode)
   const startRecording = async () => {
     stopAll(); resetState(); setStatus('ANALYZING');
+
+    // Step 1: Wake up HF Space first (it may be sleeping)
+    const wakeToast = toast.loading('Waking up backend…', { id: 'wake' });
+    await warmBackend();
+    toast.dismiss('wake');
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
 
-      // FIX 1: Use native AudioContext rate — do NOT force 16000
       const ac = new (window.AudioContext || window.webkitAudioContext)();
       audioCtxRef.current = ac;
-      const NATIVE_SR = ac.sampleRate; // typically 44100 or 48000
+      const NATIVE_SR = ac.sampleRate;
 
-      const src = ac.createMediaStreamSource(stream);
-
-      // Analyser for waveform visualisation
+      // Analyser for waveform
       const analyser = ac.createAnalyser(); analyser.fftSize = 2048;
       analyserRef.current = analyser;
+      const src = ac.createMediaStreamSource(stream);
       src.connect(analyser);
 
-      // WebSocket
-      const ws = new WebSocket(`${WS_URL}/stream`);
+      // WebSocket to backend
+      const wsProto = BACKEND_URL.startsWith('https') ? 'wss' : 'ws';
+      const wsBase  = BACKEND_URL.replace(/^https?/, wsProto);
+      const ws = new WebSocket(`${wsBase}/stream`);
       wsRef.current = ws;
 
-      // FIX 2: Valid power-of-2 buffer + typed-array accumulator (no spread crash)
-      const processor = ac.createScriptProcessor(4096, 1, 1);
-      processorRef.current = processor;
-      let accumBuf = new Float32Array(0);
-
-      processor.onaudioprocess = (ev) => {
-        const input = ev.inputBuffer.getChannelData(0);
-        // Typed-array concat — safe for large buffers
-        const merged = new Float32Array(accumBuf.length + input.length);
-        merged.set(accumBuf, 0);
-        merged.set(input, accumBuf.length);
-        accumBuf = merged;
-
-        // Every 1 second of native-rate audio accumulated
-        if (accumBuf.length >= NATIVE_SR) {
-          const raw   = accumBuf.slice(0, NATIVE_SR);
-          accumBuf    = accumBuf.slice(NATIVE_SR); // keep leftover
-          // FIX 3: Downsample from native (44100/48000) → 16000 Hz before sending
-          const chunk = downsample(raw, NATIVE_SR, 16000);
-          if (ws.readyState === WebSocket.OPEN) ws.send(chunk.buffer);
-        }
-      };
-
-      src.connect(processor);
-      processor.connect(ac.destination);
-
+      let counter = 0;
       ws.onopen = () => {
         setIsRecording(true);
         timerRef.current = setInterval(() => setElapsedSec(s => s + 1), 1000);
-        toast.success('Microphone connected — streaming live');
+        toast.success('Live stream started ✓');
       };
-
-      // FIX 4: NO stop condition — runs forever until user clicks Stop
-      let counter = 0;
       ws.onmessage = (ev) => {
         const d = JSON.parse(ev.data);
+        if (d.ping) return; // keep-alive from server
         setRiskScore(d.score || 0);
         setRiskLevel(d.risk || 'ANALYZING');
         counter++;
         setChunks(prev => [...prev, { id: counter, score: d.score || 0, risk: d.risk || 'ANALYZING' }]);
         setChartData(prev => [...prev, { t: counter, score: +((d.score || 0) * 100).toFixed(1) }]);
       };
-
-      ws.onerror = () => toast.error('WebSocket error — check backend');
+      ws.onerror = () => toast.error('WebSocket error — backend may be sleeping, try again');
       ws.onclose = () => { setIsRecording(false); setStatus(s => s === 'ANALYZING' ? 'FINISHED' : s); };
 
+      // Use AudioWorkletNode if supported (Chrome 66+), fallback to ScriptProcessor
+      try {
+        await ac.audioWorklet.addModule('/audio-processor.worklet.js');
+        const worklet = new AudioWorkletNode(ac, 'chunk-processor', {
+          processorOptions: { nativeSR: NATIVE_SR }
+        });
+        processorRef.current = worklet;
+        worklet.port.onmessage = (e) => {
+          const raw   = new Float32Array(e.data);
+          const chunk = downsample(raw, NATIVE_SR, 16000);
+          if (ws.readyState === WebSocket.OPEN) ws.send(chunk.buffer);
+        };
+        src.connect(worklet);
+        worklet.connect(ac.destination);
+      } catch {
+        // Fallback: ScriptProcessor (still works, just deprecated)
+        const proc = ac.createScriptProcessor(4096, 1, 1);
+        processorRef.current = proc;
+        let accumBuf = new Float32Array(0);
+        proc.onaudioprocess = (ev) => {
+          const input = ev.inputBuffer.getChannelData(0);
+          const merged = new Float32Array(accumBuf.length + input.length);
+          merged.set(accumBuf, 0); merged.set(input, accumBuf.length);
+          accumBuf = merged;
+          if (accumBuf.length >= NATIVE_SR) {
+            const raw = accumBuf.slice(0, NATIVE_SR);
+            accumBuf  = accumBuf.slice(NATIVE_SR);
+            const chunk = downsample(raw, NATIVE_SR, 16000);
+            if (ws.readyState === WebSocket.OPEN) ws.send(chunk.buffer);
+          }
+        };
+        src.connect(proc);
+        proc.connect(ac.destination);
+      }
+
     } catch (err) {
-      toast.error('Microphone access denied');
+      toast.error('Microphone access denied or not available');
       setStatus('IDLE');
     }
   };
